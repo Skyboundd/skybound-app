@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import tensorflow as tf
-from transformers import AutoTokenizer, TFT5ForConditionalGeneration, TFAutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, TFT5ForConditionalGeneration
+from transformers import MBartForConditionalGeneration, MBart50Tokenizer
 import os
 from google.cloud import firestore
 import re
@@ -19,19 +20,19 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "C:\projects\question-generator\s
 db = firestore.Client()
 
 # Konfigurasi Path Lokal untuk Model
-LOCAL_QG_MODEL_PATH = "C:/projects/question-generator/pretrained-v4"  
-LOCAL_TRANS_INDO_ENG_PATH = "C:/projects/question-generator/translator-indo-eng"
-LOCAL_TRANS_ENG_INDO_PATH = "C:/projects/question-generator/translator-eng-indo"
+LOCAL_QG_MODEL_PATH = "blaxx14/t5-question-generation"  
+LOCAL_TRANS_INDO_ENG_PATH = "blaxx14/indo-eng-translator"
+LOCAL_TRANS_ENG_INDO_PATH = "blaxx14/eng-indo-translator"
 
 # Pastikan file model tersedia
-if not os.path.exists(LOCAL_QG_MODEL_PATH):
-    raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_QG_MODEL_PATH}")
+# if not os.path.exists(LOCAL_QG_MODEL_PATH):
+#     raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_QG_MODEL_PATH}")
 
-if not os.path.exists(LOCAL_TRANS_INDO_ENG_PATH):
-    raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_TRANS_INDO_ENG_PATH}")
+# if not os.path.exists(LOCAL_TRANS_INDO_ENG_PATH):
+#     raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_TRANS_INDO_ENG_PATH}")
 
-if not os.path.exists(LOCAL_TRANS_ENG_INDO_PATH):
-    raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_TRANS_ENG_INDO_PATH}")
+# if not os.path.exists(LOCAL_TRANS_ENG_INDO_PATH):
+#     raise FileNotFoundError(f"Model file tidak ditemukan di path: {LOCAL_TRANS_ENG_INDO_PATH}")
 
 
 """Mengubah string menjadi dictionary"""
@@ -56,35 +57,28 @@ def parse_to_dict(input_string):
 """Mencari sinonim"""
 def get_synonyms(word):
     synonyms = set()
-
     for syn in wn.synsets(word):
         for lemma in syn.lemmas():
             synonyms.add(lemma.name())
-    
-    if word in synonyms:
-        synonyms.remove(word)
-    
     return list(synonyms)
 
 
 """Membuat distractor"""
-def generate_distractors_from_text(text, correct_answer):
-    doc = nlp(text)
+def generate_distractors(question, correct_answer):
+    doc = nlp(question)
+    
+    keywords = [token.text for token in doc if token.pos_ in ['NOUN', 'PROPN']]
     
     distractors = []
-    for token in doc:
-        if token.pos_ in ['NOUN', 'PROPN', 'ADJ', 'VERB']:  # Pilih kata benda, proper noun, adjektiva, dan verba
-            synonyms = get_synonyms(token.text)
-            if synonyms:
-                distractors.extend(synonyms)
     
-    distractors = list(set(distractors))  
-    if correct_answer in distractors:
-        distractors.remove(correct_answer)
+    for keyword in keywords:
+        synonyms = get_synonyms(keyword)
+        synonyms = [word for word in synonyms if word.lower() != correct_answer.lower()]
+        distractors.extend(synonyms)
+        
+    distractors = random.sample(distractors, min(3, len(distractors)))
     
-    random.shuffle(distractors)
-    return distractors[:3]
-
+    return distractors
 
 """Load question generator model dan tokenizer"""
 print("Loading model...")
@@ -93,8 +87,8 @@ tokenizer = AutoTokenizer.from_pretrained("t5-small")
 print("Model loaded successfully.")
 
 """Fungsi untuk menghasilkan pertanyaan"""
-def generate_question(text, max_length=512):
-    input_text = f"Generate multiple choice question: {text}"
+def generate_question(text, max_length=4096):
+    input_text = f"Generate question answer: {text}"
     input_ids = tokenizer.encode(input_text, return_tensors="tf", max_length=512, truncation=True)
 
     output = model.generate(
@@ -114,55 +108,32 @@ def generate_question(text, max_length=512):
 
 """Load translator indo eng model dan tokenizer"""
 print("Loading model...")
-translation_indo_eng = TFAutoModelForSeq2SeqLM.from_pretrained(LOCAL_TRANS_INDO_ENG_PATH, from_pt=False)
-tokenizer_indo_eng = AutoTokenizer.from_pretrained("t5-small")
+translation_model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+tokenizer_model = MBart50Tokenizer.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
 print("Model loaded successfully.")
 
-
 """Fungsi untuk menerjemahkan"""
-def translator_indo_eng(text, max_length=512):
-    input_text = f"translate Indonesia to English: {text}"
-    input_ids = tokenizer_indo_eng.encode(input_text, return_tensors="tf", max_length=max_length, truncation=True)
-
-    output = translation_indo_eng.generate(
-        input_ids,
-        max_length=max_length,
-        num_beams=10,
-        top_k=30,
-        top_p=0.95,
-        temperature=1.5,
-        do_sample=True,
-        early_stopping=True
+def translator_indo_eng(text):
+    tokenizer_model.src_lang = "id_ID"
+    encoded_hi = tokenizer_model(text, return_tensors="pt")
+    generated_tokens = translation_model.generate(
+        **encoded_hi,
+        forced_bos_token_id=tokenizer_model.lang_code_to_id["en_XX"]
     )
-
-    output_text = tokenizer_indo_eng.decode(output[0], skip_special_tokens=True)
+    output_text = tokenizer_model.batch_decode(generated_tokens, skip_special_tokens=True)
+    output_text = ' '.join(output_text)
     return output_text
 
-
-"""Load translator eng indo model dan tokenizer"""
-print("Loading model...")
-translation_eng_indo = TFAutoModelForSeq2SeqLM.from_pretrained(LOCAL_TRANS_ENG_INDO_PATH, from_pt=False)
-tokenizer_eng_indo = AutoTokenizer.from_pretrained("t5-small")
-print("Model loaded successfully.")
-
-
 """Fungsi untuk menerjemahkan"""
-def translator_eng_indo(text, max_length=512):
-    input_text = f"translate Indonesia to English: {text}"
-    input_ids = tokenizer_eng_indo.encode(input_text, return_tensors="pt", max_length=512, truncation=True)
-
-    output = translation_eng_indo.generate(
-        input_ids,
-        max_length=max_length,
-        num_beams=10,
-        top_k=0,
-        top_p=0.8,
-        temperature=1.5,
-        do_sample=True,
-        early_stopping=True
+def translator_eng_indo(text):
+    tokenizer_model.src_lang = "en_XX"
+    encoded_hi = tokenizer_model(text, return_tensors="pt")
+    generated_tokens = translation_model.generate(
+        **encoded_hi,
+        forced_bos_token_id=tokenizer_model.lang_code_to_id["id_ID"]
     )
-
-    output_text = tokenizer_eng_indo.decode(output[0], skip_special_tokens=True)
+    output_text = tokenizer_model.batch_decode(generated_tokens, skip_special_tokens=True)
+    output_text = ' '.join(output_text)
     return output_text
 
 
@@ -194,13 +165,13 @@ def split_into_parts(sentences, num_parts=5):
 @app.route('/generate-question', methods=['POST'])
 def api_generate_question():
     try:
-        # Ambil input dari request
         data = request.json
         text = data.get('text', '')
 
-        # Validasi input
         if not text:
             return jsonify({'error': 'Text tidak boleh kosong'}), 400
+
+
 
         """Run cleaning input"""
         formatted_sentences = split_text_into_sentences(text)
@@ -220,19 +191,72 @@ def api_generate_question():
         
         """Generate question"""
         question_list = []
+        
+        """versi memakai translator"""
         for i in translated_input:
-            # print(f"Result: {generate_question(i)}")
             result = generate_question(i)
-            # result = summarize_eng_indo(result) tunggu model dari caca
+            print(f"Result generate question: {generate_question(i)}")
             result_dict = parse_to_dict(result)
-            distractors = generate_distractors_from_text(i, result_dict["Answer"])
-            result_dict["distractor"] = distractors
+            distractors = generate_distractors(result_dict["Question"], result_dict["Answer"])
+            result_dict["Distractor"] = distractors
+
+            result_dict['Question'] = translator_eng_indo(result_dict['Question'])
+            result_dict['Answer'] = translator_eng_indo(result_dict['Answer'])
+            result_dict['Distractor'] = [translator_eng_indo(d) for d in result_dict['Distractor']]
+    
+            # doc_ref = db.collection('questions').document()  
+            # doc_ref.set({
+            #     'input_text': text,
+            #     'generated_question': result_dict["Question"],
+            #     'answer': result_dict["Answer"],
+            #     'distractor' : result_dict["Distractor"]
+            # })
             question_list.append(result_dict)
+        
+        try:
+            doc_ref = db.collection('questions').document()  # Buat dokumen utama
+            doc_ref.set({
+                'input_text': text  # Data input pengguna
+            })
+            # Simpan setiap elemen dalam subcollection
+            for question in question_list:
+                doc_ref.collection('generated_questions').add(question)
+        except Exception as e:
+             print({'error': str(e)})
+
+
+        """versi tidak memakai translator"""
+        # for sentence in parts:
+        #     combined_input = ' '.join(sentence)
+        #     result = generate_question(combined_input)
+        #     # result = summarize_eng_indo(result) tunggu model dari caca
+        #     result_dict = parse_to_dict(result)
+        #     print(result_dict)
+        #     distractors = generate_distractors(result_dict["Question"], result_dict["Answer"])
+        #     result_dict["distractor"] = distractors
+        #     question_list.append(result_dict)
 
         # print(question_list)
         return jsonify({'generated_question': question_list})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/get-questions', methods=['GET'])
+def api_get_questions():
+    try:
+        # Ambil semua dokumen dari koleksi 'questions'
+        questions = db.collection('questions').stream()
+
+        # Konversi dokumen ke dalam format list
+        results = []
+        for question in questions:
+            results.append(question.to_dict())
+
+        # Return hasil sebagai JSON
+        return jsonify({'questions': results}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
